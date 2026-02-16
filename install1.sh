@@ -1,31 +1,57 @@
 #!/bin/sh
-# ================================================
-# ПОЛНЫЙ СКРИПТ ДЛЯ ЧИСТОГО OpenWrt 24.10
-# AmneziaWG + Stubby (DoT) + селективная маршрутизация (Россия inside)
-# ================================================
+# =============================================================================
+# Автоматическая установка AmneziaWG 2.0 + русский интерфейс + тестовое соединение
+# Для OpenWrt 24.10.3 и новее (автоматически определяет версию)
+# =============================================================================
 
 set -e
 
-printf "\033[36;1m=== Начинаем установку с нуля ===\033[0m\n"
+# Проверка версии OpenWrt
+VERSION=$(ubus call system board | jsonfilter -e '@.release.version')
+MAJOR=$(echo "$VERSION" | cut -d. -f1)
+MINOR=$(echo "$VERSION" | cut -d. -f2)
+PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+if [ "$MAJOR" -lt 24 ] || \
+   [ "$MAJOR" -eq 24 -a "$MINOR" -lt 10 ] || \
+   [ "$MAJOR" -eq 24 -a "$MINOR" -eq 10 -a "$PATCH" -lt 3 ]; then
+    echo "Ошибка: Этот скрипт требует OpenWrt 24.10.3 или новее"
+    echo "Текущая версия: $VERSION"
+    exit 1
+fi
+
+echo "Обнаружена версия OpenWrt $VERSION → AmneziaWG 2.0 + русский интерфейс"
 
 # 1. Обновляем репозитории
 opkg update
 
-# 2. Безопасная замена dnsmasq → dnsmasq-full
-printf "\033[32;1mУстанавливаем dnsmasq-full (заменяем обычный dnsmasq)...\033[0m\n"
-cd /tmp
-opkg download dnsmasq-full
-opkg remove dnsmasq --force-removal-of-dependent-packages
-opkg install dnsmasq-full --cache /tmp/
-rm -f dnsmasq-full*.ipk
+# 2. Установка AmneziaWG 2.0 (luci-proto-amneziawg)
+PKGARCH=$(opkg print-architecture | awk 'BEGIN {max=0} {if ($3 > max) {max=$3; arch=$2}} END {print arch}')
+TARGET=$(ubus call system board | jsonfilter -e '@.release.target' | cut -d/ -f1)
+SUBTARGET=$(ubus call system board | jsonfilter -e '@.release.target' | cut -d/ -f2)
+PKGPOSTFIX="_v${VERSION}_${PKGARCH}_${TARGET}_${SUBTARGET}.ipk"
 
-# 3. Устанавливаем AmneziaWG + Stubby
-printf "\033[32;1mУстанавливаем AmneziaWG и Stubby...\033[0m\n"
-opkg install kmod-amneziawg amneziawg-tools luci-proto-amneziawg stubby
+BASE_URL="https://github.com/Slava-Shchipunov/awg-openwrt/releases/download/v${VERSION}"
 
-# 4. Настройка интерфейса awg1 (твои данные)
-printf "\033[32;1mНастраиваем AmneziaWG awg1...\033[0m\n"
-uci batch << 'EOF'
+AWG_DIR="/tmp/awg_install"
+mkdir -p "$AWG_DIR"
+
+for pkg in kmod-amneziawg amneziawg-tools luci-proto-amneziawg luci-i18n-amneziawg-ru; do
+    filename="${pkg}${PKGPOSTFIX}"
+    echo "Скачиваем $pkg..."
+    wget -O "$AWG_DIR/$filename" "${BASE_URL}/${filename}" || {
+        echo "Ошибка скачивания $pkg — проверьте интернет или репозиторий"
+        exit 1
+    }
+    opkg install "$AWG_DIR/$filename"
+done
+
+rm -rf "$AWG_DIR"
+
+# 3. Создаём тестовое соединение awg1 с твоими настройками
+echo "Создаём интерфейс awg1 с твоими параметрами..."
+
+uci batch << 'EOC'
 delete network.awg1
 set network.awg1=interface
 set network.awg1.proto='amneziawg'
@@ -47,108 +73,43 @@ set network.awg1.awg_h4='1739253821'
 # Peer
 delete network.@amneziawg_awg1[-1]
 add network amneziawg_awg1
-set network.@amneziawg_awg1[-1].name='awg1_client'
+set network.@amneziawg_awg1[-1].name='awg1_test'
 set network.@amneziawg_awg1[-1].public_key='n0z+oioqL8meQmsU1aPx0fXiMPzStqM3VwkVSmAqzG0='
 set network.@amneziawg_awg1[-1].preshared_key='4PnWMu0LNNrXyYt03CcI6KSI3NFb2wCCfbE1EDmdP1c='
 set network.@amneziawg_awg1[-1].endpoint_host='nl01a.kcufwfgnkr.net'
 set network.@amneziawg_awg1[-1].endpoint_port='62931'
 set network.@amneziawg_awg1[-1].persistent_keepalive='25'
 set network.@amneziawg_awg1[-1].allowed_ips='0.0.0.0/0 ::/0'
-set network.@amneziawg_awg1[-1].route_allowed_ips='0'   # важно для селективной маршрутизации
+set network.@amneziawg_awg1[-1].route_allowed_ips='1'   # full-tunnel (весь трафик через VPN)
 commit network
-EOF
+EOC
 
-# 5. Селективная маршрутизация (mark 0x1 → таблица vpn)
-printf "\033[32;1mНастраиваем маршрутизацию по доменам...\033[0m\n"
-grep -q "99 vpn" /etc/iproute2/rt_tables || echo "99 vpn" >> /etc/iproute2/rt_tables
+# 4. Базовая firewall-зона (если нужно — добавь forwarding вручную в LuCI)
+if ! uci show firewall | grep -q "@zone.*name='awg1'"; then
+    uci batch << 'EOC'
+    add firewall zone
+    set firewall.@zone[-1].name='awg1'
+    set firewall.@zone[-1].network='awg1'
+    set firewall.@zone[-1].input='REJECT'
+    set firewall.@zone[-1].output='ACCEPT'
+    set firewall.@zone[-1].forward='REJECT'
+    set firewall.@zone[-1].masq='1'
+    set firewall.@zone[-1].mtu_fix='1'
+    set firewall.@zone[-1].family='ipv4'
 
-uci batch << 'EOF'
-# правило mark
-delete network.@rule[-1]
-add network rule
-set network.@rule[-1].name='mark0x1'
-set network.@rule[-1].mark='0x1'
-set network.@rule[-1].priority='100'
-set network.@rule[-1].lookup='vpn'
-
-# маршрут в отдельной таблице
-set network.vpn_default=route
-set network.vpn_default.interface='awg1'
-set network.vpn_default.target='0.0.0.0'
-set network.vpn_default.netmask='0.0.0.0'
-set network.vpn_default.table='vpn'
-
-# ipset
-delete firewall.@ipset[-1]
-add firewall ipset
-set firewall.@ipset[-1].name='vpn_domains'
-set firewall.@ipset[-1].family='ipv4'
-set firewall.@ipset[-1].match='dst_net'
-
-# правило MARK
-delete firewall.@rule[-1]
-add firewall rule
-set firewall.@rule[-1].name='mark_domains'
-set firewall.@rule[-1].src='lan'
-set firewall.@rule[-1].dest='*'
-set firewall.@rule[-1].proto='all'
-set firewall.@rule[-1].ipset='vpn_domains'
-set firewall.@rule[-1].set_mark='0x1'
-set firewall.@rule[-1].target='MARK'
-set firewall.@rule[-1].family='ipv4'
-commit
-EOF
-
-# 6. Stubby (DNS over TLS)
-printf "\033[32;1mНастраиваем Stubby (DoT)...\033[0m\n"
-uci batch << 'EOF'
-set dhcp.@dnsmasq[0].noresolv='1'
-delete dhcp.@dnsmasq[0].server
-add_list dhcp.@dnsmasq[0].server='127.0.0.1#5453'
-set dhcp.@dnsmasq[0].dnssec='1'
-set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'
-commit dhcp
-EOF
-
-/etc/init.d/stubby enable
-/etc/init.d/stubby restart
-
-# 7. Список доменов (Россия inside) + cron
-printf "\033[32;1mСоздаём список российских доменов...\033[0m\n"
-cat << 'EOF' > /etc/init.d/getdomains
-#!/bin/sh /etc/rc.common
-START=99
-
-start() {
-    curl -f -s -m 15 -o /tmp/dnsmasq.d/vpn_domains.conf \
-    https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst || {
-        logger -t getdomains "Не удалось скачать список"
-        return 1
-    }
-    /etc/init.d/dnsmasq restart
-}
-EOF
-
-chmod +x /etc/init.d/getdomains
-/etc/init.d/getdomains enable
-/etc/init.d/getdomains start
-
-# cron — обновление каждые 8 часов
-if ! crontab -l | grep -q getdomains; then
-    (crontab -l; echo "0 */8 * * * /etc/init.d/getdomains start") | crontab -
-    /etc/init.d/cron restart
+    add firewall forwarding
+    set firewall.@forwarding[-1].src='lan'
+    set firewall.@forwarding[-1].dest='awg1'
+    commit firewall
+EOC
 fi
 
-# 8. Финальный рестарт
-printf "\033[32;1mПерезапускаем сеть и DNS...\033[0m\n"
- /etc/init.d/network restart
- /etc/init.d/dnsmasq restart
+# 5. Перезапуск
+echo "Перезапускаем сеть..."
+/etc/init.d/network restart
 
-printf "\033[42;1m=== УСТАНОВКА ЗАВЕРШЕНА ===\033[0m\n"
-printf "Проверь:\n"
-printf "• ping google.com\n"
-printf "• ip rule show          (должен быть mark 0x1 lookup vpn)\n"
-printf "• ip route show table vpn\n"
-printf "• logread | grep stubby\n"
-printf "• logread | grep dnsmasq\n\n"
-printf "Если всё ок — трафик к российским сайтам пойдёт через AmneziaWG.\n"
+echo "Готово!"
+echo "Проверь в LuCI → Network → Interfaces → awg1"
+echo "Статус: Up / Down"
+echo "В LuCI теперь должен быть русский интерфейс AmneziaWG"
+echo "Если VPN не поднялся — проверь логи: logread | grep amnezia"
